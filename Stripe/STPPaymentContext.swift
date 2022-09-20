@@ -692,6 +692,116 @@ public class STPPaymentContext: NSObject, STPAuthenticationContext,
             strongSelf.didFinish(with: .error, error: error)
         })
     }
+    @objc
+    public func requestApplePayment() {
+        weak var weakSelf = self
+        loadingPromise?.onSuccess({ _ in
+            guard let strongSelf = weakSelf else {
+                return
+            }
+
+            if strongSelf.state != STPPaymentContextState.none {
+                return
+            }
+
+                strongSelf.state = .requestingPayment
+                let paymentRequest = strongSelf.buildPaymentRequest()
+                let shippingAddressHandler: STPShippingAddressSelectionBlock = {
+                    shippingAddress, completion in
+                    // Apple Pay always returns a partial address here, so we won't
+                    // update self.shippingAddress or self.shippingMethods
+                    if strongSelf.delegate?.responds(
+                        to: #selector(
+                            STPPaymentContextDelegate.paymentContext(
+                                _:didUpdateShippingAddress:completion:)))
+                        ?? false
+                    {
+                        strongSelf.delegate?.paymentContext?(
+                            strongSelf, didUpdateShippingAddress: shippingAddress
+                        ) { status, _, shippingMethods, _ in
+                            completion(
+                                status, shippingMethods ?? [], strongSelf.paymentSummaryItems)
+                        }
+                    } else {
+                        completion(
+                            .valid, strongSelf.shippingMethods ?? [], strongSelf.paymentSummaryItems
+                        )
+                    }
+                }
+                let shippingMethodHandler: STPShippingMethodSelectionBlock = {
+                    shippingMethod, completion in
+                    strongSelf.selectedShippingMethod = shippingMethod
+                    strongSelf.delegate?.paymentContextDidChange(strongSelf)
+                    completion(self.paymentSummaryItems)
+                }
+                let paymentHandler: STPPaymentAuthorizationBlock = { payment in
+                    strongSelf.selectedShippingMethod = payment.shippingMethod
+                    if let shippingContact = payment.shippingContact {
+                        strongSelf.shippingAddress = STPAddress(pkContact: shippingContact)
+                    }
+                    strongSelf.shippingAddressNeedsVerification = false
+                    strongSelf.delegate?.paymentContextDidChange(strongSelf)
+                    if strongSelf.apiAdapter is STPCustomerContext {
+                        let customerContext = strongSelf.apiAdapter as? STPCustomerContext
+                        if let shippingAddress1 = strongSelf.shippingAddress {
+                            customerContext?.updateCustomer(
+                                withShippingAddress: shippingAddress1, completion: nil)
+                        }
+                    }
+                }
+                let applePayPaymentMethodHandler: STPApplePayPaymentMethodHandlerBlock = {
+                    paymentMethod, completion in
+                    strongSelf.apiAdapter.attachPaymentMethod(toCustomer: paymentMethod) {
+                        attachPaymentMethodError in
+                        stpDispatchToMainThreadIfNecessary({
+                            if attachPaymentMethodError != nil {
+                                completion(.error, attachPaymentMethodError)
+                            } else {
+                                let result = STPPaymentResult(paymentOption: paymentMethod)
+                                strongSelf.delegate?.paymentContext(
+                                    strongSelf, didCreatePaymentResult: result
+                                ) {
+                                    status, error in
+                                    // for Apple Pay, the didFinishWithStatus callback is fired later when Apple Pay VC finishes
+                                    completion(status, error)
+                                }
+                            }
+                        })
+                    }
+                }
+                if let paymentRequest = paymentRequest {
+                    strongSelf.applePayVC = PKPaymentAuthorizationViewController.stp_controller(
+                        with: paymentRequest,
+                        apiClient: strongSelf.apiClient,
+                        onShippingAddressSelection: shippingAddressHandler,
+                        onShippingMethodSelection: shippingMethodHandler,
+                        onPaymentAuthorization: paymentHandler,
+                        onPaymentMethodCreation: applePayPaymentMethodHandler,
+                        onFinish: { status, error in
+                            if strongSelf.applePayVC?.presentingViewController != nil {
+                                strongSelf.hostViewController?.dismiss(
+                                    animated: strongSelf.transitionAnimationsEnabled()
+                                ) {
+                                    strongSelf.didFinish(with: status, error: error)
+                                }
+                            } else {
+                                strongSelf.didFinish(with: status, error: error)
+                            }
+                            strongSelf.applePayVC = nil
+                        })
+                }
+                if let applePayVC1 = strongSelf.applePayVC {
+                    strongSelf.hostViewController?.present(
+                        applePayVC1,
+                        animated: strongSelf.transitionAnimationsEnabled())
+                }
+        }).onFailure({ error in
+            guard let strongSelf = weakSelf else {
+                return
+            }
+            strongSelf.didFinish(with: .error, error: error)
+        })
+    }
     private var loadingPromise: STPPromise<STPPaymentOptionTuple>?
     private weak var paymentOptionsViewController: STPPaymentOptionsViewController?
     private var state: STPPaymentContextState = .none
